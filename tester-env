@@ -1,0 +1,379 @@
+#!/usr/bin/env bash
+# tester-env CLI for Komodo (moghtech/komodo v2.3.4, commit
+# 3e2c675d43ffd80f9d4eaab3da3887cc7dab5a05).
+#
+# Builds Core and Periphery from editable source in Docker (inline Dockerfile in
+# docker-compose.tester-env.yml) and runs them with MongoDB.
+#
+# Socket-free by design: no /var/run/docker.sock, no /proc mount, no privileged
+# container, no dind. Periphery logs a docker connect warning and reports
+# docker_connected=false; resource CRUD, users/groups/permissions, procedures,
+# actions, resource syncs, alerts, settings and server system stats all work.
+# Docker-backed surfaces (containers, stacks, deployments, builds, terminals
+# into containers) are dead and out of scope.
+#
+# Services (see docker-compose.tester-env.yml):
+#   core      Rust Core on host ${PORT} -> 9120, serves the built React UI
+#   periphery Rust Periphery agent, internal only (ws://core:9120)
+#   mongo     mongo:8.0, internal only
+#
+# Ports/state: host port ${PORT:-19120} -> core:9120; every volume is scoped by
+# the compose project name, so `reset` = compose down -v.
+#
+# Deterministic credentials:
+#   admin / ${KOMODO_ADMIN_PASSWORD:-Tester-env-Password-123}
+#   (created on first boot by KOMODO_INIT_ADMIN_USERNAME/PASSWORD + LOCAL_AUTH)
+#
+# All commands accept --run-id <id> and --port <port> because scripts/rl-env
+# invokes them that way. RUN_ID scopes containers/volumes only; IMAGE_TAG scopes
+# the image.
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.tester-env.yml"
+
+RUN_ID="${RUN_ID:-}"
+PORT="${PORT:-19120}"
+# IMAGE_TAG is set by scripts/rl-env to a content-addressed tag so identical
+# (baseline, patch-set) combos share an image. Manual invocations get :dev.
+IMAGE_NAME="${IMAGE_TAG:-tester-env-komodo:dev}"
+
+SUFFIX=""
+[ -n "$RUN_ID" ] && SUFFIX="-$RUN_ID"
+PROJECT_NAME="tester-env-komodo${SUFFIX}"
+CORE_CONTAINER="tester-env-komodo-core${SUFFIX}"
+PERIPHERY_CONTAINER="tester-env-komodo-periphery${SUFFIX}"
+MONGO_CONTAINER="tester-env-komodo-mongo${SUFFIX}"
+
+# Browser-visible origin contract: scripts/rl-env exports
+# TESTER_ENV_BROWSER_ORIGIN (bridge gateway + port) so KOMODO_HOST matches the
+# origin the runner's browser actually uses. Manual runs fall back to localhost.
+APP_URL="${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}"
+LOCAL_URL="http://127.0.0.1:${PORT}"
+
+ADMIN_USER="${KOMODO_ADMIN_USERNAME:-admin}"
+ADMIN_PASSWORD="${KOMODO_ADMIN_PASSWORD:-Tester-env-Password-123}"
+
+# Fixed literals: empty JWT/webhook secrets are regenerated per start, and
+# Mongo credentials must match the volume across restarts.
+JWT_SECRET="${KOMODO_JWT_SECRET:-tester-env-komodo-jwt-secret-fixed-value-0001}"
+WEBHOOK_SECRET="${KOMODO_WEBHOOK_SECRET:-tester-env-komodo-webhook-secret-fixed-value-0001}"
+MONGO_USER="${KOMODO_DATABASE_USERNAME:-admin}"
+MONGO_PASSWORD="${KOMODO_DATABASE_PASSWORD:-tester-env-komodo-mongo-password-0001}"
+FIRST_SERVER_NAME="Local"
+
+log() { printf '==> %s\n' "$*"; }
+die() { printf '==> ERROR: %s\n' "$*" >&2; exit 1; }
+
+refresh_names() {
+  SUFFIX=""
+  [ -n "$RUN_ID" ] && SUFFIX="-$RUN_ID"
+  PROJECT_NAME="tester-env-komodo${SUFFIX}"
+  CORE_CONTAINER="tester-env-komodo-core${SUFFIX}"
+  PERIPHERY_CONTAINER="tester-env-komodo-periphery${SUFFIX}"
+  MONGO_CONTAINER="tester-env-komodo-mongo${SUFFIX}"
+  APP_URL="${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}"
+  LOCAL_URL="http://127.0.0.1:${PORT}"
+  if [ -n "${IMAGE_TAG:-}" ]; then IMAGE_NAME="$IMAGE_TAG"; fi
+}
+
+compose() {
+  IMAGE_TAG="$IMAGE_NAME" \
+  PORT="$PORT" \
+  APP_URL="$APP_URL" \
+  ADMIN_USER="$ADMIN_USER" \
+  ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+  JWT_SECRET="$JWT_SECRET" \
+  WEBHOOK_SECRET="$WEBHOOK_SECRET" \
+  MONGO_USER="$MONGO_USER" \
+  MONGO_PASSWORD="$MONGO_PASSWORD" \
+  FIRST_SERVER_NAME="$FIRST_SERVER_NAME" \
+  CORE_CONTAINER="$CORE_CONTAINER" \
+  PERIPHERY_CONTAINER="$PERIPHERY_CONTAINER" \
+  MONGO_CONTAINER="$MONGO_CONTAINER" \
+    docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" --project-directory "$SCRIPT_DIR" "$@"
+}
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die "docker is required"
+}
+
+http_status() {
+  # http_status <method> <path> [json-body] [token]
+  local method="$1" path="$2" body="${3:-}" token="${4:-}" out
+  local args=(-sS -o /dev/null -w '%{http_code}' -X "$method" "${LOCAL_URL}${path}")
+  [ -n "$token" ] && args+=(-H "authorization: ${token}")
+  [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+  out=$(curl "${args[@]}" 2>/dev/null) || true
+  printf '%s' "${out:-000}"
+}
+
+http_body() {
+  # http_body <method> <path> [json-body] [token]
+  local method="$1" path="$2" body="${3:-}" token="${4:-}"
+  local args=(-sS -X "$method" "${LOCAL_URL}${path}")
+  [ -n "$token" ] && args+=(-H "authorization: ${token}")
+  [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+  curl "${args[@]}" 2>/dev/null || true
+}
+
+json_field() {
+  # json_field <json> <dotted.path> -> raw scalar or empty
+  printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for part in sys.argv[1].split("."):
+    if not isinstance(value, dict) or part not in value:
+        sys.exit(0)
+    value = value[part]
+if value is True:
+    print("true")
+elif value is False:
+    print("false")
+elif value is not None:
+    print(value)
+' "$2"
+}
+
+# Local auth login: POST /auth/login/LoginLocalUser {username, password}
+# -> {"type":"Jwt","data":{"jwt":"..."}}.
+login_token() {
+  local body
+  body=$(http_body POST /auth/login/LoginLocalUser \
+    "$(printf '{"username":"%s","password":"%s"}' "$ADMIN_USER" "$ADMIN_PASSWORD")")
+  local jwt
+  jwt=$(json_field "$body" data.jwt)
+  [ -n "$jwt" ] || jwt=$(json_field "$body" jwt)
+  printf '%s' "$jwt"
+}
+
+wait_for_core() {
+  local deadline=$((SECONDS + 300)) status
+  log "waiting for Komodo Core on ${LOCAL_URL}"
+  while [ $SECONDS -lt $deadline ]; do
+    status=$(http_status GET /)
+    if [ "$status" = "200" ] || [ "$status" = "302" ]; then
+      log "core: UP (HTTP ${status})"
+      return 0
+    fi
+    sleep 2
+  done
+  compose logs --tail 100 core 2>&1 || true
+  die "core did not answer within 300s"
+}
+
+wait_for_admin() {
+  local deadline=$((SECONDS + 120)) token
+  log "waiting for the initial admin login (${ADMIN_USER})"
+  while [ $SECONDS -lt $deadline ]; do
+    token=$(login_token)
+    if [ -n "$token" ]; then
+      log "admin login: OK"
+      return 0
+    fi
+    sleep 2
+  done
+  compose logs --tail 100 core 2>&1 || true
+  die "admin login failed; check KOMODO_INIT_ADMIN_USERNAME/PASSWORD and the mongo volume"
+}
+
+cmd_deploy() {
+  need_docker
+  log "image ${IMAGE_NAME}"
+  log "compose project ${PROJECT_NAME}, port ${PORT}, browser origin ${APP_URL}"
+  compose up -d --build --remove-orphans
+  wait_for_core
+  wait_for_admin
+  log "Komodo is up: ${APP_URL} (local ${LOCAL_URL})"
+  log "login: ${ADMIN_USER} / ${ADMIN_PASSWORD}"
+}
+
+cmd_seed() {
+  # Deterministic, idempotent fixture for the socket-free domain. The
+  # bootstrap every scenario may rely on (admin login, Local periphery server)
+  # happens in deploy; seed only adds business records.
+  need_docker
+  wait_for_core
+  wait_for_admin
+  local token
+  token=$(login_token)
+  [ -n "$token" ] || die "admin login failed for ${ADMIN_USER}"
+  log "seeding deterministic Komodo fixtures (tags, variables, procedures, actions, users, user groups, alerters, resource sync, repo)"
+  TESTER_ENV_LOCAL_URL="$LOCAL_URL" \
+  KOMODO_JWT="$token" \
+  CORE_CONTAINER="$CORE_CONTAINER" \
+  TESTER_ENV_SEED_PASSWORD="$ADMIN_PASSWORD" \
+    python3 "$SCRIPT_DIR/scripts/tester-env-seed.py"
+}
+
+cmd_verify() {
+  need_docker
+  local status token me body
+  status=$(http_status GET /)
+  [ "$status" = "200" ] || die "UI root returned HTTP ${status}"
+
+  body=$(http_body GET /)
+  printf '%s' "$body" | grep -q 'id="root"' || die "UI root does not look like the Komodo SPA shell"
+
+  token=$(login_token)
+  [ -n "$token" ] || die "admin login failed for ${ADMIN_USER}"
+
+  status=$(http_status GET /user "" "$token")
+  [ "$status" = "200" ] || die "/user returned HTTP ${status} with the admin token"
+  me=$(http_body GET /user "" "$token")
+  [ "$(json_field "$me" username)" = "$ADMIN_USER" ] || die "unexpected current user in /user"
+
+  # The Local periphery should report in as an Ok server with system stats.
+  # docker_connected is not exposed by ListServers, so the socket-free contract
+  # is asserted from the periphery log instead. After a reset the periphery
+  # needs a few seconds to reconnect and report, so poll.
+  local deadline=$((SECONDS + 90))
+  while [ $SECONDS -lt $deadline ]; do
+    body=$(http_body POST /read/ListServers '{}' "$token")
+    if printf '%s' "$body" | python3 -c '
+import json, sys
+servers = json.load(sys.stdin)
+local = next((s for s in servers if s.get("name") == "Local"), None)
+info = (local or {}).get("info") or {}
+sys.exit(0 if info.get("state") == "Ok" and info.get("stats") else 1)
+'; then
+      break
+    fi
+    sleep 2
+  done
+  printf '%s' "$body" | python3 -c '
+import json, sys
+servers = json.load(sys.stdin)
+local = next((s for s in servers if s.get("name") == "Local"), None)
+assert local, "server Local not visible in ListServers"
+info = local.get("info") or {}
+assert info.get("state") == "Ok", "server Local state is not Ok"
+assert info.get("stats"), "server Local has no system stats"
+' || die "server ${FIRST_SERVER_NAME} did not report Ok with system stats"
+
+  # KOMODO_DISABLE_INIT_RESOURCES must keep the default scheduled procedures
+  # out. Assert by name because the seed adds its own procedures.
+  body=$(http_body POST /read/ListProcedures '{}' "$token")
+  printf '%s' "$body" | python3 -c '
+import json, sys
+names = {p.get("name") for p in json.load(sys.stdin)}
+defaults = {"Backup Core Database", "Global Auto Update", "Rotate Server Keys"}
+created = names & defaults
+assert not created, f"default init procedures were created despite KOMODO_DISABLE_INIT_RESOURCES: {sorted(created)}"
+' || die "default procedures were created despite KOMODO_DISABLE_INIT_RESOURCES"
+
+  docker logs "$PERIPHERY_CONTAINER" 2>&1 | grep -q "Failed to connect to docker api" \
+    || die "periphery did not log the expected socket-free docker warning"
+
+  log "verify OK: UI shell 200, admin login, /user, ${FIRST_SERVER_NAME} Ok with stats, no init procedures, socket-free periphery"
+
+  # Seeded product state (names, counts, flags, relationships).
+  TESTER_ENV_LOCAL_URL="$LOCAL_URL" \
+  KOMODO_JWT="$token" \
+  TESTER_ENV_SEED_PASSWORD="$ADMIN_PASSWORD" \
+    python3 "$SCRIPT_DIR/scripts/tester-env-verify.py" \
+    || die "seeded data verification failed"
+}
+
+cmd_status() {
+  need_docker
+  local health
+  if docker inspect "$CORE_CONTAINER" >/dev/null 2>&1; then
+    health=$(docker inspect -f '{{.State.Status}} / {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CORE_CONTAINER")
+    log "core: ${CORE_CONTAINER} (${health})"
+  else
+    log "core: ${CORE_CONTAINER} not created"
+  fi
+  compose ps 2>/dev/null || true
+  log "image: ${IMAGE_NAME}"
+  log "url: ${LOCAL_URL} (browser origin ${APP_URL})"
+  log "login: ${ADMIN_USER} / ${ADMIN_PASSWORD}"
+}
+
+cmd_stop() {
+  need_docker
+  compose down --remove-orphans
+}
+
+cmd_reset() {
+  need_docker
+  # Removes containers and the RUN_ID-scoped volumes (mongo data, keys, syncs,
+  # repo cache, periphery repos/stacks). The image is preserved: content-addressed
+  # tags are shared across runs; reclaim them with scripts/rl-env gc.
+  compose down -v --remove-orphans
+}
+
+cmd_logs() {
+  need_docker
+  local service="${1:-}"
+  if [ -n "$service" ]; then
+    compose logs -f --tail=200 "$service"
+  else
+    compose logs -f --tail=100
+  fi
+}
+
+usage() {
+  cat <<EOF
+Usage: ./tester-env <command> [--run-id ID] [--port PORT] [service]
+
+Commands:
+  deploy   Build core + periphery from source, start mongo/core/periphery,
+           wait for the UI and the deterministic admin login.
+  reset    Remove containers and RUN_ID-scoped volumes (image preserved).
+  stop     Stop containers, preserving volumes.
+  seed     Create the deterministic business data set (idempotent; deploy
+           must have run first).
+  verify   Assert UI shell, admin login, /user, the Local server, and the
+           seeded records (names, counts, flags, relationships).
+  status   Show compose/container state, URL and credentials.
+  logs     Follow logs (all services, or one: core|periphery|mongo).
+  help     This message.
+
+Environment:
+  IMAGE_TAG   Image name (default tester-env-komodo:dev; scripts/rl-env sets a
+              content-addressed tag)
+  RUN_ID      Scopes containers/volumes only
+  PORT        Host port (default 19120)
+  TESTER_ENV_BROWSER_ORIGIN  KOMODO_HOST origin (default http://localhost:PORT)
+  KOMODO_ADMIN_USERNAME / KOMODO_ADMIN_PASSWORD  Override the admin credentials
+
+Socket-free: no /var/run/docker.sock, no /proc mount, no privileged mode, no dind.
+EOF
+}
+
+main() {
+  local command=""
+  local positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id) RUN_ID="${2:-}"; shift 2 ;;
+      --run-id=*) RUN_ID="${1#*=}"; shift ;;
+      --port) PORT="${2:-}"; shift 2 ;;
+      --port=*) PORT="${1#*=}"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  command="${positional[0]:-help}"
+  set -- "${positional[@]:1}"
+
+  refresh_names
+
+  case "$command" in
+    deploy) cmd_deploy ;;
+    reset) cmd_reset ;;
+    stop) cmd_stop ;;
+    seed) cmd_seed ;;
+    verify) cmd_verify ;;
+    status) cmd_status ;;
+    logs) cmd_logs "${1:-}" ;;
+    help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

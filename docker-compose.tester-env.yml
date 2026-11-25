@@ -1,0 +1,183 @@
+# tester-env deployment for Komodo (moghtech/komodo v2.3.4).
+#
+# Driven by ./tester-env, which exports every variable referenced here. Do not
+# call this file directly.
+#
+# Socket-free by design: NO /var/run/docker.sock, no /proc mount, no privileged
+# container, no dind. Periphery logs "Failed to connect to docker api" and
+# reports docker_connected=false, while every non-Docker surface (resource CRUD,
+# users/groups/permissions, procedures, actions, resource syncs, alerts,
+# settings, server system stats) keeps working. Mounting the host socket would
+# give the UI the power to prune the shared host, so it is not optional.
+#
+# The Dockerfile is inline on purpose: scripts/rl-env copies only `tester-env`
+# and these COMPANION_DEPLOY_FILES into a scenario worktree, so a separate
+# Dockerfile.tester-env would be missing at build time.
+#
+# Build notes: the Rust stage is one shared workspace build producing core,
+# periphery and the km CLI, with BuildKit cache mounts for the cargo registry,
+# git checkout cache and target/ directory. Dependencies stay compiled between
+# builds, so a source mutation only rebuilds the changed crate and dependents.
+#
+# Reset: `./tester-env reset` = compose down -v over the RUN_ID-scoped project
+# (mongo data/config, keys, syncs, repo cache, periphery repos/stacks).
+services:
+  mongo:
+    image: mongo:8.0
+    container_name: ${MONGO_CONTAINER:?MONGO_CONTAINER is required}
+    command: --quiet --wiredTigerCacheSizeGB 0.25
+    restart: "no"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:?MONGO_USER is required}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:?MONGO_PASSWORD is required}
+    volumes:
+      - mongo-data:/data/db
+      - mongo-config:/data/configdb
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 10s
+
+  core:
+    image: ${IMAGE_TAG:-tester-env-komodo:dev}
+    container_name: ${CORE_CONTAINER:?CORE_CONTAINER is required}
+    build:
+      context: .
+      dockerfile_inline: |
+        # Komodo core + periphery from editable source (v2.3.4).
+        #
+        # Deliberate differences from upstream bin/core/aio.Dockerfile and
+        # bin/periphery/aio.Dockerfile:
+        #   * one shared Rust stage builds core, periphery and km, so lib/* is
+        #     compiled once instead of twice;
+        #   * cargo-strip/cargo-edit are dropped: `strip` from binutils is used
+        #     and the workspace version stays 0.0.0 instead of running
+        #     `cargo set-version` (so /version reports 0.0.0);
+        #   * starship.rs is not installed and the Docker CLI packages are not
+        #     installed (there is no daemon to talk to);
+        #   * the cargo registry and target/ are BuildKit cache mounts, and the
+        #     binaries are copied to /out so they leave the cache mount;
+        #   * core and periphery share one runtime image; the compose service
+        #     command selects the binary.
+        FROM node:22.12-alpine AS ui-builder
+        WORKDIR /builder
+        COPY client/core/ts ./client
+        COPY ui ./ui
+        RUN cd client && yarn install --frozen-lockfile --non-interactive && yarn build && yarn link
+        RUN cd ui && yarn link komodo_client && yarn install --frozen-lockfile --non-interactive && yarn build
+
+        FROM rust:1.98.0-trixie AS rust-builder
+        WORKDIR /builder
+        COPY Cargo.toml Cargo.lock ./
+        COPY lib ./lib
+        COPY client/core/rs ./client/core/rs
+        COPY client/periphery ./client/periphery
+        COPY bin/core ./bin/core
+        COPY bin/periphery ./bin/periphery
+        COPY bin/cli ./bin/cli
+        COPY xtask ./xtask
+        RUN --mount=type=cache,id=komodo-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+            --mount=type=cache,id=komodo-cargo-git,target=/usr/local/cargo/git,sharing=locked \
+            --mount=type=cache,id=komodo-cargo-target,target=/builder/target,sharing=locked \
+            cargo build --release -p komodo_core -p komodo_periphery -p komodo_cli \
+            && mkdir -p /out \
+            && cp target/release/core target/release/periphery target/release/km /out/ \
+            && strip /out/core /out/periphery /out/km
+
+        FROM debian:trixie-slim
+        RUN apt-get update \
+            && apt-get install -y --no-install-recommends ca-certificates curl git iproute2 \
+            && rm -rf /var/lib/apt/lists/*
+        WORKDIR /app
+        COPY config/core.config.toml /config/.default.config.toml
+        COPY --from=ui-builder /builder/ui/dist /app/ui
+        COPY --from=rust-builder /out/core /usr/local/bin/core
+        COPY --from=rust-builder /out/periphery /usr/local/bin/periphery
+        COPY --from=rust-builder /out/km /usr/local/bin/km
+        COPY --from=docker.io/denoland/deno:bin /deno /usr/local/bin/deno
+        ENV DENO_DIR=/action-cache/deno
+        RUN mkdir -p /action-cache && cd /action-cache && deno install jsr:@std/yaml jsr:@std/toml
+        ENV KOMODO_CLI_CONFIG_PATHS=/config
+        EXPOSE 9120 8120
+        CMD ["core"]
+    init: true
+    restart: "no"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    ports:
+      - "${PORT:?PORT is required}:9120"
+    environment:
+      TZ: Etc/UTC
+      KOMODO_DATABASE_ADDRESS: mongo:27017
+      KOMODO_DATABASE_USERNAME: ${MONGO_USER:?MONGO_USER is required}
+      KOMODO_DATABASE_PASSWORD: ${MONGO_PASSWORD:?MONGO_PASSWORD is required}
+      # Browser-visible origin (bridge gateway for scripts/rl-env runs).
+      KOMODO_HOST: ${APP_URL:?APP_URL is required}
+      KOMODO_TITLE: Komodo
+      KOMODO_LOCAL_AUTH: "true"
+      KOMODO_INIT_ADMIN_USERNAME: ${ADMIN_USER:?ADMIN_USER is required}
+      KOMODO_INIT_ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ADMIN_PASSWORD is required}
+      KOMODO_FIRST_SERVER_NAME: Local
+      KOMODO_PERIPHERY_PUBLIC_KEY: file:/config/keys/periphery.pub
+      # Fixed literals: empty values are regenerated per start, which would
+      # invalidate sessions and webhooks across a reset.
+      KOMODO_JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      KOMODO_WEBHOOK_SECRET: ${WEBHOOK_SECRET:?WEBHOOK_SECRET is required}
+      # Suppresses the default tag plus the 01:00/03:00/06:00 UTC scheduled
+      # procedures (Backup Core Database, Global Auto Update, Rotate Server
+      # Keys); rotation would break the periphery pairing mid-run.
+      KOMODO_DISABLE_INIT_RESOURCES: "true"
+      KOMODO_DEFAULT_PAGINATION_LIMIT: "25"
+      KOMODO_LOGGING_PRETTY: "false"
+      KOMODO_PRETTY_STARTUP_CONFIG: "false"
+    volumes:
+      - keys:/config/keys
+      - syncs:/syncs
+      - repo-cache:/repo-cache
+      - backups:/backups
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:9120/"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  periphery:
+    image: ${IMAGE_TAG:-tester-env-komodo:dev}
+    container_name: ${PERIPHERY_CONTAINER:?PERIPHERY_CONTAINER is required}
+    init: true
+    restart: "no"
+    command: ["periphery"]
+    depends_on:
+      core:
+        condition: service_started
+    environment:
+      TZ: Etc/UTC
+      PERIPHERY_CORE_ADDRESS: ws://core:9120
+      PERIPHERY_CONNECT_AS: ${FIRST_SERVER_NAME:-Local}
+      PERIPHERY_CORE_PUBLIC_KEYS: file:/config/keys/core.pub
+      PERIPHERY_PRIVATE_KEY: file:/config/keys/periphery.key
+      PERIPHERY_ROOT_DIRECTORY: /etc/komodo
+      # Keeps the reported disk size to the container's root mount area.
+      PERIPHERY_INCLUDE_DISK_MOUNTS: /etc/hostname
+      PERIPHERY_LOGGING_PRETTY: "false"
+      PERIPHERY_PRETTY_STARTUP_CONFIG: "false"
+    volumes:
+      - keys:/config/keys
+      - repos:/etc/komodo/repos
+      - stacks:/etc/komodo/stacks
+      - builds:/etc/komodo/builds
+
+volumes:
+  mongo-data:
+  mongo-config:
+  keys:
+  syncs:
+  repo-cache:
+  backups:
+  repos:
+  stacks:
+  builds:
